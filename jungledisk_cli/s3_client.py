@@ -1,6 +1,7 @@
 """S3 client module for interacting with JungleDisk buckets."""
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 from typing import List, Dict, Optional, Any
 import logging
@@ -21,11 +22,24 @@ class JungleDiskS3Client:
             region: AWS region (default: us-east-1)
         """
         self.bucket_name = bucket_name
+        
+        # Configure connection pooling for better performance
+        config = Config(
+            max_pool_connections=20,  # Increase from default of 10
+            retries={
+                'max_attempts': 3,
+                'mode': 'adaptive'  # Adaptive retry mode
+            },
+            read_timeout=60,  # Socket read timeout
+            connect_timeout=10  # Socket connect timeout
+        )
+        
         self.s3_client = boto3.client(
             's3',
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
-            region_name=region
+            region_name=region,
+            config=config
         )
         
     def list_objects(self, prefix: str = '', delimiter: str = '/') -> Dict[str, Any]:

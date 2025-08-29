@@ -7,6 +7,8 @@ import os
 from typing import Optional
 from pathlib import Path
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 from .s3_client import JungleDiskS3Client
 from .parser import JungleDiskParser
 from .jungledisk_lister import JungleDiskLister
@@ -164,8 +166,10 @@ def _format_size(size: int) -> str:
     return f"{size:.1f} PB"
 
 
-def _download_recursive(downloader, lister, parser, remote_path: str, local_path: Optional[str], password: str):
-    """Download all files from a directory recursively.
+def _download_recursive(downloader, lister, parser, remote_path: str, local_path: Optional[str], 
+                       password: str, skip_existing: bool = True, max_concurrent: int = 5, 
+                       no_progress: bool = False):
+    """Download all files from a directory recursively with concurrent downloads.
     
     Args:
         downloader: JungleDiskDownloader instance
@@ -174,16 +178,17 @@ def _download_recursive(downloader, lister, parser, remote_path: str, local_path
         remote_path: Remote directory path
         local_path: Local directory to save files (optional)
         password: Decryption password (optional)
+        skip_existing: Whether to skip existing files
+        max_concurrent: Maximum concurrent downloads
+        no_progress: Disable progress bar
     """
     # Normalize remote path
     remote_path = parser.parse_path(remote_path)
     
     # If no local path specified, use the directory name from remote path
     if not local_path:
-        # Extract directory name from remote path
         remote_dir = os.path.basename(remote_path.rstrip('/'))
         if not remote_dir or remote_dir == '/':
-            # If downloading root or can't determine name, use 'downloads'
             local_path = 'downloads'
         else:
             local_path = remote_dir
@@ -192,79 +197,136 @@ def _download_recursive(downloader, lister, parser, remote_path: str, local_path
     local_dir = Path(local_path)
     local_dir.mkdir(parents=True, exist_ok=True)
     
-    click.echo(f"Downloading files from {remote_path} to {local_path}/")
+    click.echo(f"Scanning {remote_path} for files...")
     
-    # Track statistics
-    total_files = 0
-    total_size = 0
-    failed_files = []
+    # First, collect all files to download
+    all_files = []
     
-    def download_directory(remote_dir: str, local_dir: Path, indent: int = 0):
-        """Recursively download files from a directory."""
-        nonlocal total_files, total_size, failed_files
-        
-        # List contents of the directory
+    def collect_files(remote_dir: str, local_dir: Path):
+        """Recursively collect all files to download."""
         try:
             results = lister.list_path(remote_dir)
         except Exception as e:
             logger.error(f"Failed to list directory {remote_dir}: {e}")
             return
         
-        # Process files first
+        # Collect files
         files = results.get('files', [])
         for file_info in files:
             file_name = file_info['name']
             file_size = file_info['size']
             
-            # Build full remote and local paths
             remote_file_path = os.path.join(remote_dir, file_name).replace('\\', '/')
             local_file_path = local_dir / file_name
             
-            # Show progress
-            indent_str = "  " * indent
-            click.echo(f"{indent_str}Downloading: {file_name} ({_format_size(file_size)})")
-            
-            # Download the file
-            try:
-                success = downloader.download_file(remote_file_path, str(local_file_path))
-                if success:
-                    total_files += 1
-                    total_size += file_size
-                    click.echo(f"{indent_str}  ✓ Saved to: {local_file_path}")
-                else:
-                    failed_files.append(remote_file_path)
-                    click.echo(f"{indent_str}  ✗ Failed to download")
-            except Exception as e:
-                failed_files.append(remote_file_path)
-                click.echo(f"{indent_str}  ✗ Error: {e}")
+            all_files.append({
+                'remote_path': remote_file_path,
+                'local_path': str(local_file_path),
+                'size': file_size,
+                'name': file_name
+            })
         
         # Process subdirectories
         directories = results.get('directories', [])
         for dir_info in directories:
-            dir_name = dir_info['name']
-            
-            # Build paths for subdirectory
+            dir_name = dir_info['name'].rstrip('/')
             remote_subdir = os.path.join(remote_dir, dir_name).replace('\\', '/')
             local_subdir = local_dir / dir_name
             
             # Create local subdirectory
             local_subdir.mkdir(parents=True, exist_ok=True)
             
-            # Show directory being processed
-            indent_str = "  " * indent
-            click.echo(f"{indent_str}[DIR] {dir_name}/")
-            
-            # Recursively download subdirectory
-            download_directory(remote_subdir, local_subdir, indent + 1)
+            # Recursively collect files
+            collect_files(remote_subdir, local_subdir)
     
-    # Start recursive download
-    download_directory(remote_path, local_dir)
+    # Collect all files
+    collect_files(remote_path, local_dir)
+    
+    if not all_files:
+        click.echo("No files found to download.")
+        return
+    
+    # Filter out existing files if skip_existing
+    files_to_download = []
+    skipped_files = []
+    
+    for file_info in all_files:
+        if downloader.should_download_file(file_info['local_path'], 
+                                          file_info['size'], 
+                                          skip_existing):
+            files_to_download.append(file_info)
+        else:
+            skipped_files.append(file_info)
+    
+    if skipped_files:
+        click.echo(f"Skipping {len(skipped_files)} existing files")
+    
+    if not files_to_download:
+        click.echo("All files already exist locally.")
+        return
+    
+    total_size = sum(f['size'] for f in files_to_download)
+    click.echo(f"\nDownloading {len(files_to_download)} files ({_format_size(total_size)}) "
+               f"with {max_concurrent} concurrent downloads...")
+    
+    # Download files concurrently
+    failed_files = []
+    successful_downloads = 0
+    downloaded_size = 0
+    
+    # Create progress bars
+    if not no_progress:
+        file_pbar = tqdm(total=len(files_to_download), unit='files', desc='Files')
+        size_pbar = tqdm(total=total_size, unit='B', unit_scale=True, desc='Size')
+    
+    def download_file_wrapper(file_info):
+        """Wrapper to download a single file."""
+        try:
+            success = downloader.download_file(
+                file_info['remote_path'], 
+                file_info['local_path'],
+                skip_existing=skip_existing
+            )
+            return file_info, success
+        except Exception as e:
+            logger.error(f"Error downloading {file_info['remote_path']}: {e}")
+            return file_info, False
+    
+    # Use ThreadPoolExecutor for concurrent downloads
+    with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+        futures = {
+            executor.submit(download_file_wrapper, file_info): file_info 
+            for file_info in files_to_download
+        }
+        
+        for future in as_completed(futures):
+            file_info, success = future.result()
+            
+            if success:
+                successful_downloads += 1
+                downloaded_size += file_info['size']
+                if not no_progress:
+                    file_pbar.update(1)
+                    size_pbar.update(file_info['size'])
+            else:
+                failed_files.append(file_info['remote_path'])
+                if not no_progress:
+                    file_pbar.update(1)
+                    file_pbar.set_postfix({'failed': len(failed_files)})
+    
+    # Close progress bars
+    if not no_progress:
+        file_pbar.close()
+        size_pbar.close()
     
     # Show summary
     click.echo("\n" + "=" * 60)
     click.echo(f"Download complete:")
-    click.echo(f"  Files downloaded: {total_files}")
-    click.echo(f"  Total size: {_format_size(total_size)}")
+    click.echo(f"  Files downloaded: {successful_downloads}/{len(files_to_download)}")
+    click.echo(f"  Total size: {_format_size(downloaded_size)}")
+    
+    if skipped_files:
+        click.echo(f"  Files skipped: {len(skipped_files)}")
     
     if password and downloader.decryptor and downloader.decryptor.key_loaded:
         click.echo("  Status: Decrypted")
@@ -273,7 +335,7 @@ def _download_recursive(downloader, lister, parser, remote_path: str, local_path
     
     if failed_files:
         click.echo(f"\n  Failed downloads: {len(failed_files)}")
-        for failed in failed_files[:5]:  # Show first 5 failures
+        for failed in failed_files[:5]:
             click.echo(f"    - {failed}")
         if len(failed_files) > 5:
             click.echo(f"    ... and {len(failed_files) - 5} more")
@@ -297,10 +359,17 @@ def _download_recursive(downloader, lister, parser, remote_path: str, local_path
               help='JungleDisk password for decryption (or set JUNGLEDISK_PASSWORD env var)')
 @click.option('--recursive', '-R', is_flag=True,
               help='Download all files recursively from a directory')
+@click.option('--skip-existing', is_flag=True, default=True,
+              help='Skip files that already exist locally with matching size (default: True)')
+@click.option('--max-concurrent', '-j', default=5, type=int,
+              help='Maximum concurrent downloads (default: 5)')
+@click.option('--no-progress', is_flag=True,
+              help='Disable progress bar')
 @click.argument('remote_path')
 @click.argument('local_path', required=False)
 def download(access_key: str, secret_key: str, bucket: str, region: str,
-             password: str, recursive: bool, remote_path: str, local_path: Optional[str]):
+             password: str, recursive: bool, skip_existing: bool, max_concurrent: int,
+             no_progress: bool, remote_path: str, local_path: Optional[str]):
     """Download a file or directory from JungleDisk S3 bucket.
     
     REMOTE_PATH is the path in JungleDisk (e.g., /helen/file.txt or /helen/backups/)
@@ -328,7 +397,8 @@ def download(access_key: str, secret_key: str, bucket: str, region: str,
         
         if recursive:
             # Recursive download of a directory
-            _download_recursive(downloader, lister, parser, remote_path, local_path, password)
+            _download_recursive(downloader, lister, parser, remote_path, local_path, password,
+                              skip_existing, max_concurrent, no_progress)
         else:
             # Single file download - first check if it's actually a directory
             # Normalize the path
@@ -371,7 +441,7 @@ def download(access_key: str, secret_key: str, bucket: str, region: str,
             logger.info(f"Downloading {remote_path} to {local_path}")
             
             # Download the file
-            success = downloader.download_file(remote_path, local_path)
+            success = downloader.download_file(remote_path, local_path, skip_existing)
             
             if success:
                 click.echo(f"✓ File downloaded successfully to {local_path}")

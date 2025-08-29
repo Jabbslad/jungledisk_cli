@@ -1,8 +1,11 @@
 """JungleDisk file downloader module."""
 
+import os
 import logging
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 from .s3_client import JungleDiskS3Client
 from .parser import JungleDiskParser
@@ -104,7 +107,38 @@ class JungleDiskDownloader:
             
         return False
             
-    def download_file(self, remote_path: str, local_path: str) -> bool:
+    def should_download_file(self, local_path: str, remote_size: int = None, skip_existing: bool = True) -> bool:
+        """Check if a file should be downloaded.
+        
+        Args:
+            local_path: Local file path
+            remote_size: Remote file size in bytes (optional)
+            skip_existing: Whether to skip existing files
+            
+        Returns:
+            True if file should be downloaded
+        """
+        if not skip_existing:
+            return True
+            
+        if not os.path.exists(local_path):
+            return True
+            
+        # If we have remote size, compare it
+        if remote_size is not None:
+            local_size = os.path.getsize(local_path)
+            if local_size != remote_size:
+                logger.debug(f"Size mismatch for {local_path}: local={local_size}, remote={remote_size}")
+                return True
+            else:
+                logger.debug(f"Skipping existing file with matching size: {local_path}")
+                return False
+        
+        # If no remote size, skip if file exists
+        logger.debug(f"Skipping existing file: {local_path}")
+        return False
+    
+    def download_file(self, remote_path: str, local_path: str, skip_existing: bool = True) -> bool:
         """Download a file from JungleDisk.
         
         According to JungleDisk documentation:
@@ -114,6 +148,7 @@ class JungleDiskDownloader:
         Args:
             remote_path: Path in JungleDisk (e.g., /helen/backups/file.txt)
             local_path: Local path to save the file
+            skip_existing: Whether to skip existing files with matching size
             
         Returns:
             True if download successful
@@ -140,6 +175,11 @@ class JungleDiskDownloader:
             marker = file_info['marker']
             blocksize = file_info.get('blocksize', 0)
             total_size = file_info.get('size', 0)
+            
+            # Check if we should skip this file
+            if skip_existing and not self.should_download_file(local_path, total_size, skip_existing):
+                logger.info(f"Skipping existing file: {local_path}")
+                return True  # Return True as it's not an error
             
             # Download actual file content from FILES/marker/blockindex
             file_content = self._download_file_blocks(marker, blocksize, total_size, pointer_key)
