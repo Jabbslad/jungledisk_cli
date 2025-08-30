@@ -46,11 +46,14 @@ def cli(debug: bool):
 @click.option('--region', '-r', 
               default=lambda: os.environ.get('AWS_REGION', 'us-east-1'),
               help='AWS region (or set AWS_REGION env var)')
+@click.option('--password', '-p',
+              default=lambda: os.environ.get('JUNGLEDISK_PASSWORD', ''),
+              help='JungleDisk password for decrypting filenames (or set JUNGLEDISK_PASSWORD env var)')
 @click.option('--format', '-f', type=click.Choice(['simple', 'detailed', 'json']), 
               default='simple', help='Output format')
 @click.argument('path', default='/')
 def list(access_key: str, secret_key: str, bucket: str, region: str, 
-         format: str, path: str):
+         password: str, format: str, path: str):
     """List files in a JungleDisk S3 bucket path (non-recursive).
     
     PATH is the directory path to list (default: /)
@@ -70,7 +73,57 @@ def list(access_key: str, secret_key: str, bucket: str, region: str,
         # Initialize components
         client = JungleDiskS3Client(access_key, secret_key, bucket, region)
         parser = JungleDiskParser()
-        lister = JungleDiskLister(client, parser)
+        
+        # Initialize decryptor if password provided
+        decryptor = None
+        if password:
+            from .decryptor import JungleDiskDecryptor
+            # Try to find and load the 0.key file
+            try:
+                # Look for 0.key file in the user's directory from the path
+                username = path.strip('/').split('/')[0] if path.strip('/') else None
+                
+                if username:
+                    key_file_path = f"{username}/0.key"
+                    logger.debug(f"Looking for 0.key file at {key_file_path}")
+                    
+                    try:
+                        key_content = client.download_object(key_file_path)
+                        metadata = client.get_object_metadata(key_file_path)
+                        
+                        decryptor = JungleDiskDecryptor(password)
+                        if decryptor.load_key_file(key_content, metadata):
+                            logger.info("Encryption keys loaded for filename decryption")
+                        else:
+                            logger.warning("Failed to load encryption keys - filenames may appear encrypted")
+                            decryptor = None
+                    except Exception as e:
+                        logger.debug(f"Could not load 0.key file: {e}")
+                        # Try all users if no specific user in path
+                        if not username or '/' not in path.strip('/'):
+                            response = client.s3_client.list_objects_v2(
+                                Bucket=client.bucket_name,
+                                Delimiter='/',
+                                MaxKeys=10
+                            )
+                            for prefix_info in response.get('CommonPrefixes', []):
+                                user_prefix = prefix_info['Prefix'].rstrip('/')
+                                key_file_path = f"{user_prefix}/0.key"
+                                try:
+                                    key_content = client.download_object(key_file_path)
+                                    metadata = client.get_object_metadata(key_file_path)
+                                    decryptor = JungleDiskDecryptor(password)
+                                    if decryptor.load_key_file(key_content, metadata):
+                                        logger.info(f"Encryption keys loaded from {key_file_path}")
+                                        break
+                                    else:
+                                        decryptor = None
+                                except:
+                                    continue
+            except Exception as e:
+                logger.debug(f"Could not initialize decryptor: {e}")
+        
+        lister = JungleDiskLister(client, parser, decryptor)
         
         # Normalize path
         normalized_path = parser.parse_path(path)

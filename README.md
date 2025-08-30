@@ -109,6 +109,7 @@ jungledisk download --recursive --no-progress /username/directory/
 - **Download files** with automatic decryption (single files or entire directories)
 - **Recursive downloads** for backing up entire directory structures
 - **JungleDisk 2.0 format support** including custom Base64 encoding and EVP_BytesToKey
+- **Filename encryption support** automatically decrypts encrypted filenames when password is provided
 - **Smart path resolution** handles filenames with special characters and Unicode
 - **Multiple authentication methods**: environment variables, .env files, or command-line options
 - **Flexible output formats**: simple, detailed, or JSON for integration with other tools

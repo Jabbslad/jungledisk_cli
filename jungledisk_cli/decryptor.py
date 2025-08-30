@@ -208,6 +208,13 @@ class JungleDiskDecryptor:
             if filename_key_elem is not None and filename_key_elem.text:
                 self.filename_key = self._decode_jungledisk_base64(filename_key_elem.text)
                 logger.debug(f"Loaded filename key: {len(self.filename_key)} bytes")
+            elif self.encrypt_filenames and self.encryption_key:
+                # If filename encryption is enabled but no separate key, derive it from encryption key
+                # According to JungleDisk source: EVP_BytesToKey(new byte[0], Encoding.Default.GetBytes(encryptionKey), 1, keyBytes, new byte[0])
+                # The encryptionKey is used as-is (not base64 decoded) for the derivation
+                key_bytes, _ = self.evp_bytes_to_key(b'', self.encryption_key.encode(), 1, 32, 0)
+                self.filename_key = key_bytes  # Store as bytes, not string
+                logger.debug(f"Derived filename key from encryption key: {len(self.filename_key)} bytes")
                 
         except Exception as e:
             logger.error(f"Failed to parse key XML: {e}")
@@ -243,6 +250,69 @@ class JungleDiskDecryptor:
         standard = base64.b64encode(data).decode('ascii')
         return standard.replace('=', '_').replace('+', '[').replace('/', ']')
             
+    def decrypt_filename(self, encrypted_name: str, marker: str = None) -> Optional[str]:
+        """Decrypt an encrypted filename.
+        
+        JungleDisk encrypts filenames using AES-256 CBC mode with the filename key.
+        The IV is derived from the file/directory marker (UUID).
+        
+        Args:
+            encrypted_name: Base64-encoded encrypted filename (using JungleDisk encoding)
+            marker: The UUID marker of the file/directory (required for CBC mode)
+            
+        Returns:
+            Decrypted filename or None if decryption fails
+        """
+        if not self.filename_key:
+            logger.debug("No filename encryption key available")
+            return None
+            
+        if not marker:
+            logger.debug("No marker provided for filename decryption")
+            return None
+            
+        try:
+            # Remove any trailing underscores (used as markers, not padding)
+            clean_name = encrypted_name.rstrip('_')
+            
+            # Replace JungleDisk chars with standard base64
+            standard = clean_name.replace('[', '+').replace(']', '/')
+            
+            # Add proper padding if needed
+            padding = (4 - len(standard) % 4) % 4
+            standard = standard + '=' * padding
+            
+            # Decode base64
+            encrypted_bytes = base64.b64decode(standard)
+            
+            # Derive IV from marker (based on JungleDisk source: IvecFromMarker)
+            # Convert hex string marker to bytes for IV
+            iv = bytes.fromhex(marker[:32])  # Use first 16 bytes (32 hex chars)
+            
+            # Decrypt using AES-256 CBC mode
+            cipher = Cipher(
+                algorithms.AES(self.filename_key[:32]),  # Use first 32 bytes for AES-256
+                modes.CBC(iv),
+                backend=default_backend()
+            )
+            
+            decryptor = cipher.decryptor()
+            decrypted = decryptor.update(encrypted_bytes) + decryptor.finalize()
+            
+            # Remove null bytes and any padding
+            # JungleDisk uses null termination for strings
+            result = decrypted.rstrip(b'\x00').decode('utf-8', errors='ignore')
+            
+            # Remove any remaining non-printable characters at the end
+            while result and ord(result[-1]) < 32:
+                result = result[:-1]
+            
+            return result
+            
+        except Exception as e:
+            logger.debug(f"Failed to decrypt filename '{encrypted_name}' with marker '{marker}': {e}")
+            return None
+    
     def decrypt_file(self, encrypted_data: bytes, metadata: Dict[str, str] = None) -> Optional[bytes]:
         """Decrypt a JungleDisk encrypted file.
         

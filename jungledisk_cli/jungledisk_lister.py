@@ -13,15 +13,17 @@ logger = logging.getLogger(__name__)
 class JungleDiskLister:
     """Handles listing operations for JungleDisk buckets with proper directory resolution."""
     
-    def __init__(self, client: JungleDiskS3Client, parser: JungleDiskParser):
+    def __init__(self, client: JungleDiskS3Client, parser: JungleDiskParser, decryptor=None):
         """Initialize the lister.
         
         Args:
             client: JungleDisk S3 client instance
             parser: JungleDisk parser instance
+            decryptor: Optional JungleDiskDecryptor instance for filename decryption
         """
         self.client = client
         self.parser = parser
+        self.decryptor = decryptor
         self.directory_map = {}  # Cache for directory UUID to name mapping
         
     def list_path(self, path: str) -> Dict[str, Any]:
@@ -96,9 +98,17 @@ class JungleDiskLister:
                 if item_id not in seen_items:
                     seen_items.add(item_id)
                     
+                    # Try to decrypt the name if encryption is enabled
+                    display_name = item_name
+                    if self.decryptor and self.decryptor.encrypt_filenames:
+                        decrypted = self.decryptor.decrypt_filename(item_name, item_uuid)
+                        if decrypted:
+                            display_name = decrypted
+                            logger.debug(f"Decrypted {'directory' if item_type == 'dir' else 'file'} name: {item_name} -> {decrypted}")
+                    
                     if item_type == 'dir':
                         directories.append({
-                            'name': item_name + '/',
+                            'name': display_name + '/',
                             'path': key,
                             'type': 'directory',
                             'size': 0,
@@ -106,7 +116,7 @@ class JungleDiskLister:
                         })
                     elif item_type == 'file':
                         file_info = {
-                            'name': item_name,
+                            'name': display_name,
                             'path': key,
                             'size': 0,
                             'uuid': item_uuid
@@ -210,8 +220,16 @@ class JungleDiskLister:
                     item_type = parts[3]
                     item_name = parts[4]
                     
+                    # Decrypt the item name if encryption is enabled
+                    actual_item_name = item_name
+                    if self.decryptor and self.decryptor.encrypt_filenames:
+                        item_uuid = parts[2] if len(parts) > 2 else None
+                        decrypted = self.decryptor.decrypt_filename(item_name, item_uuid)
+                        if decrypted:
+                            actual_item_name = decrypted
+                    
                     # Normalize names for comparison (handle smart quotes and other variations)
-                    normalized_item_name = normalize_name_for_comparison(item_name)
+                    normalized_item_name = normalize_name_for_comparison(actual_item_name)
                     normalized_part_name = normalize_name_for_comparison(part_name)
                     
                     if item_type == 'dir' and normalized_item_name == normalized_part_name:
@@ -274,9 +292,17 @@ class JungleDiskLister:
                     if item_id not in seen_items:
                         seen_items.add(item_id)
                         
+                        # Try to decrypt the name if encryption is enabled
+                        display_name = item_name
+                        if self.decryptor and self.decryptor.encrypt_filenames:
+                            decrypted = self.decryptor.decrypt_filename(item_name, item_uuid)
+                            if decrypted:
+                                display_name = decrypted
+                                logger.debug(f"Decrypted {'directory' if item_type == 'dir' else 'file'} name: {item_name} -> {decrypted}")
+                        
                         if item_type == 'dir':
                             directories.append({
-                                'name': item_name + '/',
+                                'name': display_name + '/',
                                 'path': key,
                                 'type': 'directory',
                                 'size': 0,
@@ -284,7 +310,7 @@ class JungleDiskLister:
                             })
                         elif item_type == 'file':
                             file_info = {
-                                'name': item_name,
+                                'name': display_name,
                                 'path': key,
                                 'size': 0,
                                 'uuid': item_uuid
@@ -459,11 +485,19 @@ class JungleDiskLister:
                         if item_id not in seen_items:
                             seen_items.add(item_id)
                             
+                            # Try to decrypt the name if encryption is enabled
+                            display_name = parsed['name']
+                            if self.decryptor and self.decryptor.encrypt_filenames:
+                                decrypted = self.decryptor.decrypt_filename(parsed['name'], parsed['item_uuid'])
+                                if decrypted:
+                                    display_name = decrypted
+                                    logger.debug(f"Decrypted {'directory' if parsed['is_dir'] else 'file'} name: {parsed['name']} -> {decrypted}")
+                            
                             if parsed['is_dir']:
-                                directories.add(parsed['name'])
+                                directories.add(display_name)
                             else:
                                 file_info = {
-                                    'name': parsed['name'],
+                                    'name': display_name,
                                     'path': key,
                                     'size': parsed.get('size', 0),
                                     'last_modified': None
@@ -512,25 +546,26 @@ class JungleDiskLister:
             if dir_name in ['FILES', 'ROOT'] or dir_name.endswith('.key') or dir_name.endswith('.dir'):
                 continue
                 
-            # Try to get the real name of this directory
-            real_name = self._get_directory_name(dir_path.rstrip('/'))
+            # First check if the directory name itself is encrypted
+            display_name = dir_name
+            if self.decryptor and self.decryptor.encrypt_filenames:
+                # The dir_name might be the UUID itself in this context
+                # We can't decrypt without a marker, so skip
+                pass
             
-            if real_name:
-                directories.append({
-                    'name': real_name + '/',
-                    'path': dir_path,
-                    'type': 'directory',
-                    'size': 0,
-                    'uuid': dir_name
-                })
-            else:
-                # If we can't resolve the name, show the UUID
-                directories.append({
-                    'name': dir_name + '/',
-                    'path': dir_path,
-                    'type': 'directory', 
-                    'size': 0
-                })
+            # If it's still a UUID after attempted decryption, try to get the real name from contents
+            if len(display_name) == 32:
+                real_name = self._get_directory_name(dir_path.rstrip('/'))
+                if real_name:
+                    display_name = real_name
+            
+            directories.append({
+                'name': display_name + '/',
+                'path': dir_path,
+                'type': 'directory',
+                'size': 0,
+                'uuid': dir_name
+            })
                 
         # Process files in the root
         for obj in response.get('Contents', []):
@@ -543,8 +578,18 @@ class JungleDiskLister:
             # Parse the file
             parsed = self.parser.parse_jungledisk_path(key)
             if parsed and parsed.get('name') and not parsed['is_dir']:
+                display_name = parsed['name']
+                
+                # Try to decrypt the filename if encryption is enabled
+                if self.decryptor and self.decryptor.encrypt_filenames:
+                    # Use the item_uuid as the marker for decryption
+                    decrypted = self.decryptor.decrypt_filename(parsed['name'], parsed.get('item_uuid'))
+                    if decrypted:
+                        display_name = decrypted
+                        logger.debug(f"Decrypted filename: {parsed['name']} -> {decrypted}")
+                
                 files.append({
-                    'name': parsed['name'],
+                    'name': display_name,
                     'path': key,
                     'size': parsed.get('size', 0)
                 })

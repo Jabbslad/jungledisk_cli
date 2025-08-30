@@ -37,6 +37,9 @@ class JungleDiskDownloader:
         # Initialize decryptor if password provided
         if password:
             self._initialize_decryptor(password)
+            # Share the decryptor with the lister for filename resolution
+            if self.decryptor and self.lister:
+                self.lister.decryptor = self.decryptor
             
     def _initialize_decryptor(self, password: str):
         """Initialize the decryptor with the 0.key file.
@@ -424,8 +427,15 @@ class JungleDiskDownloader:
                 parsed = self.parser.parse_jungledisk_path(key)
                 
                 if parsed and parsed.get('name'):
+                    # Try to decrypt the name if encryption is enabled
+                    actual_name = parsed['name']
+                    if self.decryptor and self.decryptor.encrypt_filenames:
+                        decrypted = self.decryptor.decrypt_filename(parsed['name'], parsed.get('item_uuid'))
+                        if decrypted:
+                            actual_name = decrypted
+                    
                     # Normalize the found name for comparison
-                    normalized_found_name = normalize_name_for_comparison(parsed['name'])
+                    normalized_found_name = normalize_name_for_comparison(actual_name)
                     if normalized_found_name == normalized_filename and parsed['type'] == 'file':
                         return key
                     
