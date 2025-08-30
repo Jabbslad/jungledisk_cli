@@ -47,7 +47,7 @@ def cli(debug: bool):
               default=lambda: os.environ.get('AWS_REGION', 'us-east-1'),
               help='AWS region (or set AWS_REGION env var)')
 @click.option('--password', '-p',
-              default=lambda: os.environ.get('JUNGLEDISK_PASSWORD', ''),
+              default=None,
               help='JungleDisk password for decrypting filenames (or set JUNGLEDISK_PASSWORD env var)')
 @click.option('--format', '-f', type=click.Choice(['simple', 'detailed', 'json']), 
               default='simple', help='Output format')
@@ -68,6 +68,10 @@ def list(access_key: str, secret_key: str, bucket: str, region: str,
     if not bucket:
         logger.error("Bucket name is required. Set via --bucket or JUNGLEDISK_BUCKET env var")
         sys.exit(1)
+    
+    # Use password from command line if provided, otherwise fall back to environment
+    if password is None:
+        password = os.environ.get('JUNGLEDISK_PASSWORD', '')
         
     try:
         # Initialize components
@@ -408,7 +412,7 @@ def _download_recursive(downloader, lister, parser, remote_path: str, local_path
               default=lambda: os.environ.get('AWS_REGION', 'us-east-1'),
               help='AWS region (or set AWS_REGION env var)')
 @click.option('--password', '-p',
-              default=lambda: os.environ.get('JUNGLEDISK_PASSWORD', ''),
+              default=None,
               help='JungleDisk password for decryption (or set JUNGLEDISK_PASSWORD env var)')
 @click.option('--recursive', '-R', is_flag=True,
               help='Download all files recursively from a directory')
@@ -440,6 +444,10 @@ def download(access_key: str, secret_key: str, bucket: str, region: str,
     if not bucket:
         logger.error("Bucket name is required. Set via --bucket or JUNGLEDISK_BUCKET env var")
         sys.exit(1)
+    
+    # Use password from command line if provided, otherwise fall back to environment
+    if password is None:
+        password = os.environ.get('JUNGLEDISK_PASSWORD', '')
         
     try:
         # Initialize components
