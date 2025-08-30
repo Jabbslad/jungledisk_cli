@@ -256,48 +256,42 @@ def _download_recursive(downloader, lister, parser, remote_path: str, local_path
     
     click.echo(f"Scanning {remote_path} for files...")
     
-    # First, collect all files to download
+    # Use the efficient recursive listing method
+    try:
+        files_list, total_count = lister.list_recursive(remote_path)
+    except Exception as e:
+        logger.error(f"Failed to list directory {remote_path}: {e}")
+        click.echo(f"Error: Failed to list directory: {e}")
+        return
+    
+    # Convert the flat list to the format needed for downloading
     all_files = []
+    base_path_parts = len(remote_path.rstrip('/').split('/'))
     
-    def collect_files(remote_dir: str, local_dir: Path):
-        """Recursively collect all files to download."""
-        try:
-            results = lister.list_path(remote_dir)
-        except Exception as e:
-            logger.error(f"Failed to list directory {remote_dir}: {e}")
-            return
+    for file_info in files_list:
+        # Get the full remote path
+        remote_file_path = file_info['path']
         
-        # Collect files
-        files = results.get('files', [])
-        for file_info in files:
-            file_name = file_info['name']
-            file_size = file_info['size']
-            
-            remote_file_path = os.path.join(remote_dir, file_name).replace('\\', '/')
-            local_file_path = local_dir / file_name
-            
-            all_files.append({
-                'remote_path': remote_file_path,
-                'local_path': str(local_file_path),
-                'size': file_size,
-                'name': file_name
-            })
+        # Calculate the relative path from the base directory
+        path_parts = remote_file_path.split('/')
+        relative_parts = path_parts[base_path_parts:]
         
-        # Process subdirectories
-        directories = results.get('directories', [])
-        for dir_info in directories:
-            dir_name = dir_info['name'].rstrip('/')
-            remote_subdir = os.path.join(remote_dir, dir_name).replace('\\', '/')
-            local_subdir = local_dir / dir_name
-            
-            # Create local subdirectory
-            local_subdir.mkdir(parents=True, exist_ok=True)
-            
-            # Recursively collect files
-            collect_files(remote_subdir, local_subdir)
-    
-    # Collect all files
-    collect_files(remote_path, local_dir)
+        # Construct the local path maintaining directory structure
+        if relative_parts:
+            local_file_path = local_dir / '/'.join(relative_parts)
+        else:
+            # File is in the root of the remote path
+            local_file_path = local_dir / file_info['name']
+        
+        # Ensure the parent directory exists
+        local_file_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        all_files.append({
+            'remote_path': remote_file_path,
+            'local_path': str(local_file_path),
+            'size': file_info['size'],
+            'name': file_info['name']
+        })
     
     if not all_files:
         click.echo("No files found to download.")

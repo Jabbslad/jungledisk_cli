@@ -1,8 +1,9 @@
 """Specialized lister for JungleDisk directory structures."""
 
-from typing import Dict, List, Any, Set, Optional
+from typing import Dict, List, Any, Set, Optional, Tuple
 import logging
 from collections import defaultdict
+from pathlib import Path
 from .s3_client import JungleDiskS3Client
 from .parser import JungleDiskParser
 from .utils import normalize_name_for_comparison
@@ -25,6 +26,7 @@ class JungleDiskLister:
         self.parser = parser
         self.decryptor = decryptor
         self.directory_map = {}  # Cache for directory UUID to name mapping
+        self.uuid_cache = {}  # Cache for path to UUID mapping
         
     def list_path(self, path: str) -> Dict[str, Any]:
         """List files and directories at the specified path (non-recursive).
@@ -194,6 +196,12 @@ class JungleDiskLister:
         Returns:
             UUID of the directory or None if not found
         """
+        # Check cache first
+        cache_key = f"{username}/{dir_path}"
+        if cache_key in self.uuid_cache:
+            logger.debug(f"UUID cache hit for {cache_key}")
+            return self.uuid_cache[cache_key]
+        
         # Start from ROOT to find the directory
         path_parts = dir_path.split('/')
         current_prefix = f"{username}/ROOT/"
@@ -242,6 +250,11 @@ class JungleDiskLister:
             
             if not found:
                 return None
+        
+        # Cache the result
+        if current_uuid:
+            self.uuid_cache[cache_key] = current_uuid
+            logger.debug(f"Cached UUID for {cache_key}: {current_uuid}")
         
         return current_uuid
     
@@ -656,3 +669,235 @@ class JungleDiskLister:
                 
         # Direct child has exactly 2 UUIDs (parent and item)
         return uuid_count <= 2
+    
+    def list_recursive(self, path: str) -> Tuple[List[Dict], int]:
+        """Efficiently list all files recursively from a path.
+        
+        This method is optimized for bulk operations like recursive downloads.
+        It recursively fetches all nested directories and their contents.
+        
+        Args:
+            path: Path to list recursively (e.g., /jabbslad/Documents/)
+            
+        Returns:
+            Tuple of (list of file dictionaries, total count)
+        """
+        # Normalize the path
+        normalized_path = self.parser.parse_path(path)
+        prefix = normalized_path.lstrip('/')
+        
+        logger.info(f"Starting recursive scan of {normalized_path}")
+        
+        # Parse to get username and directory
+        parts = prefix.rstrip('/').split('/')
+        if not parts or not parts[0]:
+            return [], 0
+        
+        username = parts[0]
+        
+        # We need to recursively fetch all UUID directories
+        # Start with the initial directory
+        directories_to_process = []
+        
+        if len(parts) == 1:
+            # Root directory - start from ROOT
+            directories_to_process.append({
+                'uuid': 'ROOT',
+                'path': f"/{username}",
+                'prefix': f"{username}/ROOT/"
+            })
+        else:
+            # Subdirectory - resolve its UUID first
+            dir_path = '/'.join(parts[1:])
+            dir_uuid = self._resolve_directory_uuid(username, dir_path)
+            if not dir_uuid:
+                logger.warning(f"Could not resolve directory: {dir_path}")
+                return [], 0
+            directories_to_process.append({
+                'uuid': dir_uuid,
+                'path': normalized_path,
+                'prefix': f"{username}/{dir_uuid}/"
+            })
+        
+        # Process all directories and subdirectories
+        all_objects = []
+        processed_dirs = set()
+        api_calls = 0
+        
+        while directories_to_process:
+            current_dir = directories_to_process.pop(0)
+            
+            if current_dir['uuid'] in processed_dirs:
+                continue
+            processed_dirs.add(current_dir['uuid'])
+            
+            logger.debug(f"Processing directory: {current_dir['path']} (UUID: {current_dir['uuid']})")
+            
+            # Fetch objects for this directory
+            continuation_token = None
+            while True:
+                api_calls += 1
+                if continuation_token:
+                    response = self.client.s3_client.list_objects_v2(
+                        Bucket=self.client.bucket_name,
+                        Prefix=current_dir['prefix'],
+                        ContinuationToken=continuation_token,
+                        MaxKeys=1000
+                    )
+                else:
+                    response = self.client.s3_client.list_objects_v2(
+                        Bucket=self.client.bucket_name,
+                        Prefix=current_dir['prefix'],
+                        MaxKeys=1000
+                    )
+                
+                objects = response.get('Contents', [])
+                all_objects.extend(objects)
+                
+                # Look for subdirectories (UUID directories)
+                for obj in objects:
+                    key = obj['Key']
+                    parsed = self.parser.parse_jungledisk_path(key)
+                    if parsed and parsed.get('is_dir'):
+                        # This is a directory entry, add it to process list
+                        subdir_uuid = parsed.get('item_uuid')
+                        if subdir_uuid and subdir_uuid not in processed_dirs:
+                            subdir_name = parsed.get('name', '')
+                            if self.decryptor and self.decryptor.encrypt_filenames:
+                                decrypted = self.decryptor.decrypt_filename(subdir_name, subdir_uuid)
+                                if decrypted:
+                                    subdir_name = decrypted
+                            
+                            subdir_info = {
+                                'uuid': subdir_uuid,
+                                'path': f"{current_dir['path']}/{subdir_name}",
+                                'prefix': f"{username}/{subdir_uuid}/"
+                            }
+                            directories_to_process.append(subdir_info)
+                            logger.debug(f"Added subdirectory to process: {subdir_info['path']}")
+                
+                if not response.get('IsTruncated'):
+                    break
+                continuation_token = response.get('NextContinuationToken')
+        
+        logger.info(f"Fetched {len(all_objects)} objects with {api_calls} API calls")
+        
+        # Process all objects to build file tree
+        files = []
+        processed_items = set()
+        
+        for obj in all_objects:
+            key = obj['Key']
+            
+            # Skip metadata files
+            if self.parser.is_metadata_file(key):
+                continue
+            
+            # Parse the JungleDisk path
+            parsed = self.parser.parse_jungledisk_path(key)
+            if not parsed or not parsed.get('name'):
+                continue
+            
+            # Skip directories for file listing
+            if parsed.get('is_dir'):
+                continue
+            
+            # Create unique identifier to avoid duplicates
+            item_id = f"{parsed['item_uuid']}/{parsed['name']}"
+            if item_id in processed_items:
+                continue
+            processed_items.add(item_id)
+            
+            # Decrypt filename if needed
+            display_name = parsed['name']
+            if self.decryptor and self.decryptor.encrypt_filenames:
+                decrypted = self.decryptor.decrypt_filename(parsed['name'], parsed['item_uuid'])
+                if decrypted:
+                    display_name = decrypted
+            
+            # Build the logical path for this file
+            # We need to reconstruct the directory structure
+            file_path = self._build_logical_path(username, parsed, all_objects, normalized_path)
+            
+            if file_path:
+                files.append({
+                    'path': file_path,  # Changed from 'remote_path' to 'path' for consistency
+                    'name': display_name,
+                    'size': parsed.get('size', 0),
+                    's3_key': key,
+                    'uuid': parsed['item_uuid']
+                })
+        
+        logger.info(f"Found {len(files)} files in recursive scan")
+        return files, len(files)
+    
+    def _build_logical_path(self, username: str, file_parsed: Dict, all_objects: List, base_path: str) -> Optional[str]:
+        """Build the logical path for a file by resolving its parent directories.
+        
+        Args:
+            username: Username
+            file_parsed: Parsed file information
+            all_objects: All S3 objects for reference
+            base_path: Base path we're listing from
+            
+        Returns:
+            Full logical path or None
+        """
+        # Build a mapping of UUIDs to directory names
+        uuid_to_name = {}
+        
+        for obj in all_objects:
+            key = obj['Key']
+            parsed = self.parser.parse_jungledisk_path(key)
+            if parsed and parsed.get('is_dir'):
+                # Decrypt directory name if needed
+                dir_name = parsed['name']
+                if self.decryptor and self.decryptor.encrypt_filenames:
+                    decrypted = self.decryptor.decrypt_filename(parsed['name'], parsed['item_uuid'])
+                    if decrypted:
+                        dir_name = decrypted
+                uuid_to_name[parsed['item_uuid']] = dir_name
+        
+        # Build the path from the file up to the base
+        path_parts = []
+        current_uuid = file_parsed.get('parent_uuid')
+        
+        # Add the filename
+        file_name = file_parsed['name']
+        if self.decryptor and self.decryptor.encrypt_filenames:
+            decrypted = self.decryptor.decrypt_filename(file_parsed['name'], file_parsed['item_uuid'])
+            if decrypted:
+                file_name = decrypted
+        
+        # Build path backwards from file to root
+        parent_path_parts = []
+        while current_uuid and current_uuid != 'ROOT':
+            if current_uuid in uuid_to_name:
+                parent_path_parts.insert(0, uuid_to_name[current_uuid])
+            
+            # Find parent of this directory
+            found_parent = False
+            for obj in all_objects:
+                key = obj['Key']
+                if f"/{current_uuid}/dir/" in key:
+                    parsed = self.parser.parse_jungledisk_path(key)
+                    if parsed and parsed['item_uuid'] == current_uuid:
+                        current_uuid = parsed.get('parent_uuid')
+                        found_parent = True
+                        break
+            
+            if not found_parent:
+                break
+        
+        # Construct the full path
+        if base_path.strip('/'):
+            # We're in a subdirectory, use the base path
+            path = base_path.rstrip('/') + '/' + '/'.join(parent_path_parts + [file_name])
+        else:
+            # Root listing
+            path = '/' + username + '/' + '/'.join(parent_path_parts + [file_name])
+        
+        # Clean up the path
+        path = path.replace('//', '/')
+        
+        return path
