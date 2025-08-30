@@ -254,6 +254,9 @@ def _download_recursive(downloader, lister, parser, remote_path: str, local_path
     local_dir = Path(local_path)
     local_dir.mkdir(parents=True, exist_ok=True)
     
+    # Log what we're using as the local directory
+    logger.info(f"Using local directory: {local_dir.absolute()}")
+    
     click.echo(f"Scanning {remote_path} for files...")
     
     # Use the efficient recursive listing method
@@ -268,6 +271,17 @@ def _download_recursive(downloader, lister, parser, remote_path: str, local_path
     all_files = []
     base_path_parts = len(remote_path.rstrip('/').split('/'))
     
+    # Debug first file to understand path structure
+    if files_list and len(files_list) > 0:
+        first_file = files_list[0]
+        logger.debug(f"First file path from list_recursive: {first_file['path']}")
+        logger.debug(f"Remote path: {remote_path}, base_path_parts: {base_path_parts}")
+        # Find first file with 'iPhoto' in path for debugging
+        for f in files_list[:100]:
+            if 'iPhoto' in f['path']:
+                logger.debug(f"iPhoto file path: {f['path']}")
+                break
+    
     for file_info in files_list:
         # Get the full remote path
         remote_file_path = file_info['path']
@@ -276,15 +290,32 @@ def _download_recursive(downloader, lister, parser, remote_path: str, local_path
         path_parts = remote_file_path.split('/')
         relative_parts = path_parts[base_path_parts:]
         
+        # Debug problematic paths
+        if relative_parts and relative_parts[0] and relative_parts[0].startswith('iPhoto'):
+            logger.debug(f"DEBUG iPhoto: remote_file_path={remote_file_path}")
+            logger.debug(f"DEBUG iPhoto: path_parts={path_parts}")
+            logger.debug(f"DEBUG iPhoto: relative_parts={relative_parts}")
+        
         # Construct the local path maintaining directory structure
         if relative_parts:
-            local_file_path = local_dir / '/'.join(relative_parts)
+            # Filter out any empty parts and join
+            clean_parts = [p for p in relative_parts if p]
+            if clean_parts:
+                relative_path = '/'.join(clean_parts)
+                local_file_path = local_dir / relative_path
+            else:
+                local_file_path = local_dir / file_info['name']
         else:
             # File is in the root of the remote path
             local_file_path = local_dir / file_info['name']
         
-        # Ensure the parent directory exists
-        local_file_path.parent.mkdir(parents=True, exist_ok=True)
+        # Ensure the parent directory exists (safely)
+        try:
+            local_file_path.parent.mkdir(parents=True, exist_ok=True)
+        except PermissionError as e:
+            logger.error(f"Permission error creating directory {local_file_path.parent}: {e}")
+            logger.error(f"Full path was: {local_file_path}")
+            continue
         
         all_files.append({
             'remote_path': remote_file_path,

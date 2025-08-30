@@ -782,9 +782,28 @@ class JungleDiskLister:
         
         logger.info(f"Fetched {len(all_objects)} objects with {api_calls} API calls")
         
+        # Build UUID to directory name mapping ONCE for all files
+        logger.info("Building directory index...")
+        uuid_to_dir_info = {}
+        for obj in all_objects:
+            key = obj['Key']
+            parsed = self.parser.parse_jungledisk_path(key)
+            if parsed and parsed.get('is_dir'):
+                dir_name = parsed['name']
+                if self.decryptor and self.decryptor.encrypt_filenames:
+                    decrypted = self.decryptor.decrypt_filename(dir_name, parsed['item_uuid'])
+                    if decrypted:
+                        dir_name = decrypted
+                uuid_to_dir_info[parsed['item_uuid']] = {
+                    'name': dir_name,
+                    'parent_uuid': parsed.get('parent_uuid')
+                }
+        logger.info(f"Built index with {len(uuid_to_dir_info)} directories")
+        
         # Process all objects to build file tree
         files = []
         processed_items = set()
+        file_count = 0
         
         for obj in all_objects:
             key = obj['Key']
@@ -815,9 +834,13 @@ class JungleDiskLister:
                 if decrypted:
                     display_name = decrypted
             
+            file_count += 1
+            if file_count % 1000 == 0:
+                logger.info(f"Processed {file_count} files...")
+            
             # Build the logical path for this file
             # We need to reconstruct the directory structure
-            file_path = self._build_logical_path(username, parsed, all_objects, normalized_path)
+            file_path = self._build_logical_path_optimized(username, parsed, uuid_to_dir_info, normalized_path)
             
             if file_path:
                 files.append({
@@ -830,6 +853,43 @@ class JungleDiskLister:
         
         logger.info(f"Found {len(files)} files in recursive scan")
         return files, len(files)
+    
+    def _build_logical_path_optimized(self, username: str, file_parsed: Dict, uuid_to_dir_info: Dict, base_path: str) -> Optional[str]:
+        """Build the logical path for a file using pre-built UUID mapping.
+        
+        This is an optimized version that uses a pre-built directory index
+        instead of iterating through all objects for each file.
+        
+        Args:
+            username: Username
+            file_parsed: Parsed file information
+            uuid_to_dir_info: Pre-built UUID to directory info mapping
+            base_path: Base path we're listing from
+            
+        Returns:
+            Full logical path or None
+        """
+        # Add the filename
+        file_name = file_parsed['name']
+        if self.decryptor and self.decryptor.encrypt_filenames:
+            decrypted = self.decryptor.decrypt_filename(file_parsed['name'], file_parsed['item_uuid'])
+            if decrypted:
+                file_name = decrypted
+        
+        # Build path backwards from file to root
+        parent_path_parts = []
+        current_uuid = file_parsed.get('parent_uuid')
+        
+        while current_uuid and current_uuid != 'ROOT' and current_uuid in uuid_to_dir_info:
+            dir_info = uuid_to_dir_info[current_uuid]
+            parent_path_parts.insert(0, dir_info['name'])
+            current_uuid = dir_info.get('parent_uuid')
+        
+        # Construct the full path
+        if parent_path_parts:
+            return f"{base_path}/{'/'.join(parent_path_parts)}/{file_name}"
+        else:
+            return f"{base_path}/{file_name}"
     
     def _build_logical_path(self, username: str, file_parsed: Dict, all_objects: List, base_path: str) -> Optional[str]:
         """Build the logical path for a file by resolving its parent directories.
